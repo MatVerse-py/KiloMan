@@ -1,0 +1,82 @@
+name: MatVerse Governance Agent
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_run:
+    workflows: [CI, Test, Build]
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+  checks: write
+  actions: read
+
+env:
+  MATVERSE_API: ${{ secrets.MATVERSE_API_URL }}
+  MATVERSE_API_KEY: ${{ secrets.MATVERSE_API_KEY }}
+
+jobs:
+  analyze-repository:
+    name: Analyze Repository Health
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.compute.outputs.result }}
+      omega: ${{ steps.parse.outputs.omega }}
+      decision: ${{ steps.parse.outputs.decision }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute Governance Metrics
+        id: compute
+        run: |
+          cd "${{ github.workspace }}/src/lib/matverse"
+          RESULT=$(python3 compute_metrics.py)
+          echo "result=$RESULT" >> "$GITHUB_OUTPUT"
+          echo "$RESULT"
+
+      - name: Parse Decision
+        id: parse
+        run: |
+          RESULT='${{ steps.compute.outputs.result }}'
+          OMEGA=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['omega'])")
+          DECISION=$(echo "$RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['decision'])")
+          echo "omega=$OMEGA" >> "$GITHUB_OUTPUT"
+          echo "decision=$DECISION" >> "$GITHUB_OUTPUT"
+
+      - name: Record to MatVerse Ledger
+        if: env.MATVERSE_API != ''
+        run: |
+          RESULT='${{ steps.compute.outputs.result }}'
+          curl -sS -X POST "$MATVERSE_API/api/ledger" \
+            -H "Authorization: Bearer $MATVERSE_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "{\"repository\":\"${{ github.repository }}\",\"sha\":\"${{ github.sha }}\",\"result\":$RESULT}"
+
+  governance-comment:
+    name: Post Governance Decision
+    needs: analyze-repository
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const result = JSON.parse(`${{ toJson(needs.analyze-repository.outputs.result) }}`)
+            const decision = `${{ needs.analyze-repository.outputs.decision }}`
+            const omega = `${{ needs.analyze-repository.outputs.omega }}`
+            const emoji = decision === 'PASS' ? '✅' : decision === 'ESCALATE' ? '⚠️' : '❌'
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `## MatVerse Governance ${emoji}\n\n**Ω:** ${omega}\n**Decision:** ${decision}\n\n\
+**Raw:** \`${JSON.stringify(result)}\`\n\n---\n*Governed by MatVerse*`
+            })
